@@ -113,6 +113,8 @@ spec:
         - containerPort: 3000
           name: http
         env:
+        - name: GITEA____APP_NAME
+          value: Code
 {{- if .Values.oidc.enabled }}
         - name: GITEA__security__REVERSE_PROXY_LOGOUT_REDIRECT
           value: /oauth2/sign_out?rd=/signed-out

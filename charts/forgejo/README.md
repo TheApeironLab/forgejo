@@ -1,7 +1,8 @@
-# Forgejo application chart
+# Code application chart
 
-This repository owns the Git application chart. It deploys one Forgejo Helm release
-(application ID `git`) using the reviewed, digest-pinned upstream container image.
+This repository owns the **Code** application chart, powered by Forgejo. It deploys one Forgejo Helm release
+(stable application ID `git`, Chart name `forgejo`) using the reviewed, digest-pinned upstream container image.
+The application title is configured as **Code** through Forgejo’s root `APP_NAME` setting (`GITEA____APP_NAME`).
 The source mirror retains the upstream source and license; the chart does not build
 or upgrade the upstream application as a side effect of installation.
 
