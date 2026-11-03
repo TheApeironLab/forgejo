@@ -1,0 +1,9 @@
+apiVersion: v2
+name: forgejo
+type: application
+version: 0.1.0
+appVersion: "15.0.9"
+description: Code repository and review application for Apeiron, powered by Forgejo.
+sources:
+  - https://codeberg.org/forgejo/forgejo
+  - https://github.com/TheApeironLab/forgejo

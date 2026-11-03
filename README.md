@@ -1,3 +1,6 @@
+**Apeiron Code** — the team code repository and review app, powered by Forgejo.
+The application-owned Helm chart is [charts/forgejo](charts/forgejo/README.md).
+
 <div align="center">
     <img src="./assets/logo.svg" alt="" width="192" align="center" />
     <h1 align="center">Welcome to Forgejo</h1>
