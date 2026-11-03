@@ -1,0 +1,330 @@
+{{- $port := ternary "" (printf ":%d" (int (.Values.publicHttpsPort | default 443))) (eq (int (.Values.publicHttpsPort | default 443)) 443) -}}
+{{- $host := default (printf "git.%s" .Values.domain) .Values.publicHost -}}
+{{- /* 原生登录源（sso.enabled，默认开）与 oauth2-proxy 代理（oidc.enabled）两种 SSO 模式互斥：两边的 prepare
+     都覆盖写 Secret git-oidc（同一 client git-app、不同回调），同时开着会互相覆盖（部署前校验同样拒绝） */}}
+{{- if and .Values.sso.enabled .Values.oidc.enabled }}
+{{- fail "sso.enabled and oidc.enabled are mutually exclusive (both write Secret git/git-oidc for Keycloak client git-app): set sso.enabled=false to use the oauth2-proxy mode" }}
+{{- end }}
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: git-data
+  namespace: {{ .Release.Namespace }}
+spec:
+  accessModes: ["ReadWriteOnce"]
+  storageClassName: {{ .Values.storageClass }}
+  resources:
+    requests:
+      storage: {{ .Values.storage }}
+---
+# git（Forgejo v15 LTS）单副本：Web UI + API 走 3000；SSH 不出集群，clone 走 http(s)。
+# 数据库用平台共享 postgres，凭据在 Secret git-db（chentu secrets init 生成，configure.sh 用它建库）。
+# Forgejo 照认 GITEA__<段>__<键> 环境变量（源码按 ^(FORGEJO|GITEA)__ 匹配，P2 02b K-09）。
+{{- $d := .Values.domain }}
+{{- $img := .Values.image }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: git
+  namespace: {{ .Release.Namespace }}
+  labels:
+    app: git
+spec:
+  replicas: 1               # 首次点击缺口的预热只对单副本有效（stack/git/RUNBOOK.md「SSO」）
+  strategy:
+    type: Recreate          # RWO 卷
+  selector:
+    matchLabels:
+      app: git
+  template:
+    metadata:
+      labels:
+        app: git
+      annotations:
+        kubectl.kubernetes.io/default-container: git
+{{- if .Values.oidc.enabled }}
+        checksum/sso-config: {{ include (print $.Template.BasePath "/sso.yaml") . | sha256sum }}
+{{- end }}
+    spec:
+      imagePullSecrets:
+      - name: registry-pull
+      # 镜像内 git 用户是 UID 1000；local-path/longhorn 新卷属 root，用 fsGroup 让 /data 可写
+      securityContext:
+        fsGroup: 1000
+      containers:
+{{- if .Values.oidc.enabled }}
+      - name: sso
+        image: {{ .Values.registry }}/oauth2-proxy/oauth2-proxy:v7.15.5
+        args:
+        - --alpha-config=/etc/sso/alpha.yaml
+        - --redirect-url=https://{{ $host }}{{ $port }}/oauth2/callback
+        - --email-domain=*
+        - --cookie-name=__Host-git-sso
+        - --cookie-secure=true
+        - --cookie-samesite=lax
+        - --cookie-refresh=2m
+        - --cookie-expire=8h
+        - --reverse-proxy=true
+        - --trusted-proxy-ip={{ required "oidc.trustedProxyCIDRs is required when SSO is enabled" (join "," .Values.oidc.trustedProxyCIDRs) }}
+        - --skip-provider-button=true
+        - --skip-auth-route=^/api/v1/
+        - --skip-auth-route=^/[^/]+/[^/]+/info/lfs/
+        - --skip-auth-route=^/signed-out$
+        - --skip-auth-route=^/api/healthz$
+        - --skip-auth-route=^/[^/]+/[^/]+/(info/refs|git-upload-pack|git-receive-pack)$
+        env:
+        - name: SSO_CLIENT_ID
+          valueFrom:
+            secretKeyRef: {name: git-oidc, key: client-id}
+        - name: SSO_CLIENT_SECRET
+          valueFrom:
+            secretKeyRef: {name: git-oidc, key: client-secret}
+        - name: SSO_ISSUER
+          valueFrom:
+            secretKeyRef: {name: git-oidc, key: issuer}
+        - name: OAUTH2_PROXY_COOKIE_SECRET
+          valueFrom:
+            secretKeyRef: {name: git-sso-session, key: cookie-secret}
+        ports:
+        - name: sso
+          containerPort: 4180
+        volumeMounts:
+        - name: sso-config
+          mountPath: /etc/sso
+          readOnly: true
+        - name: chentu-ca
+          mountPath: /etc/chentu-ca
+          readOnly: true
+        resources:
+          requests: {cpu: 50m, memory: 64Mi}
+          limits: {cpu: "1", memory: 256Mi}
+        readinessProbe:
+          httpGet: {path: /ready, port: sso}
+        livenessProbe:
+          httpGet: {path: /ping, port: sso}
+          initialDelaySeconds: 30
+{{- end }}
+      - name: git
+        # tag 只给人看与 bundle 路径对得上；拉取与运行以 index digest 为准（containerd 按 digest 取）
+        image: {{ printf "%s/%s:%s@%s" .Values.registry $img.repository $img.tag $img.digest | quote }}
+        imagePullPolicy: IfNotPresent
+        ports:
+        - containerPort: 3000
+          name: http
+        env:
+{{- if .Values.oidc.enabled }}
+        - name: GITEA__security__REVERSE_PROXY_LOGOUT_REDIRECT
+          value: /oauth2/sign_out?rd=/signed-out
+        - name: GITEA__server__HTTP_ADDR
+          value: "127.0.0.1"
+        - name: GITEA__service__ENABLE_REVERSE_PROXY_AUTHENTICATION
+          value: "true"
+        - name: GITEA__service__ENABLE_REVERSE_PROXY_AUTO_REGISTRATION
+          value: "false"
+        - name: GITEA__service__ENABLE_REVERSE_PROXY_EMAIL
+          value: "false"
+        - name: GITEA__service__ENABLE_REVERSE_PROXY_AUTHENTICATION_API
+          value: "false"
+        - name: GITEA__security__REVERSE_PROXY_TRUSTED_PROXIES
+          value: "127.0.0.1/32,::1/128"
+        - name: GITEA__security__REVERSE_PROXY_LIMIT
+          value: "1"
+        - name: GITEA__security__REVERSE_PROXY_AUTHENTICATION_USER
+          value: X-Forwarded-Preferred-Username
+        - name: GITEA__security__REVERSE_PROXY_AUTHENTICATION_EMAIL
+          value: X-Forwarded-Email
+{{- end }}
+        - name: GITEA__database__DB_TYPE
+          value: postgres
+        - name: GITEA__database__HOST
+          value: {{ .Values.postgresHost }}
+        - name: GITEA__database__NAME
+          value: git
+        - name: GITEA__database__USER
+          value: git
+        - name: GITEA__database__PASSWD
+          valueFrom:
+            secretKeyRef: {name: git-db, key: password}
+        - name: GITEA__server__DOMAIN
+          value: {{ $host }}
+        - name: GITEA__server__LFS_START_SERVER
+          value: "true"
+        - name: GITEA__server__ROOT_URL
+          value: https://{{ $host }}{{ $port }}
+        # 关掉安装向导；管理员由 configure.sh 用 CLI 建（凭据在 Secret git-admin）
+        - name: GITEA__security__INSTALL_LOCK
+          value: "true"
+        # ---- 离线：不出网 ----
+        # OFFLINE_MODE：前端不从 CDN 拉 Gravatar / 字体等资源；update_checker 是定时查新版本的
+        # cron（段名带点，环境变量里点写成 _0X2E_）
+        - name: GITEA__server__OFFLINE_MODE
+          value: "true"
+        - name: GITEA__cron_0X2E_update_checker__ENABLED
+          value: "false"
+        # ---- 账号只经平台 SSO 产生（R-CI-19，#70）：关自助注册；首次 SSO 登录自动建号；
+        # 不把外部身份接管到同名或同邮箱的本地账号；不走 OpenID 2.0 登录与注册。
+        - name: GITEA__service__DISABLE_REGISTRATION
+          value: "true"
+        - name: GITEA__oauth2_client__ENABLE_AUTO_REGISTRATION
+          value: "true"
+        - name: GITEA__oauth2_client__ACCOUNT_LINKING
+          value: disabled
+        # v15 不认 preferred_username（告警后回退 nickname，P2 02b K-12）；Keycloak client git-app 的
+        # nickname←username mapper 让用户名等于 Keycloak 用户名（identity-sso R-IDS-91）
+        - name: GITEA__oauth2_client__USERNAME
+          value: nickname
+        - name: GITEA__oauth2_client__UPDATE_AVATAR
+          value: "false"
+        - name: GITEA__openid__ENABLE_OPENID_SIGNIN
+          value: "false"
+        - name: GITEA__openid__ENABLE_OPENID_SIGNUP
+          value: "false"
+        # ---- webhook 只投递给 Woodpecker（R-CI-32，P2 F-1）：集群内 woodpecker.<domain> 解析到
+        # Traefik 的私网地址，默认的 external 会拒绝投递；只放这一个主机，不放开整个 private。
+        - name: GITEA__webhook__ALLOWED_HOST_LIST
+          value: woodpecker.{{ $d }}
+        # ---- 内部 CA：系统 CA + chentu-ca 都可信（discovery/token/userinfo 走 https://iam.<domain>，
+        # webhook 走 https://woodpecker.<domain>）。Go 按冒号分隔读 SSL_CERT_DIR 下的每个文件。
+        - name: SSL_CERT_DIR
+          value: /etc/ssl/certs:/etc/chentu-ca
+        volumeMounts:
+        - name: git-data
+          mountPath: /data
+        - name: chentu-ca
+          mountPath: /etc/chentu-ca
+          readOnly: true
+        resources:
+          requests:
+            cpu: {{ .Values.cpuRequest }}
+            memory: {{ .Values.memoryRequest }}
+          limits:
+            cpu: {{ .Values.cpuLimit | quote }}
+            memory: {{ .Values.memoryLimit }}
+        # 就绪不依赖 Keycloak：Keycloak 挂了 git 与 CI 照常可用（只有 SSO 登录不可用，ci spec CAP-CI-4 Q4）
+        readinessProbe:
+{{- if .Values.oidc.enabled }}
+          exec:
+            command: [curl, --fail, --silent, "http://127.0.0.1:3000/api/healthz"]
+{{- else }}
+          httpGet:
+            path: /api/healthz
+            port: http
+{{- end }}
+          initialDelaySeconds: 15
+          periodSeconds: 10
+          failureThreshold: 30
+        livenessProbe:
+{{- if .Values.oidc.enabled }}
+          exec:
+            command: [curl, --fail, --silent, "http://127.0.0.1:3000/api/healthz"]
+{{- else }}
+          httpGet:
+            path: /api/healthz
+            port: http
+{{- end }}
+          initialDelaySeconds: 120
+          periodSeconds: 30
+          failureThreshold: 5
+      volumes:
+{{- if .Values.oidc.enabled }}
+      - name: sso-config
+        configMap: {name: git-sso}
+{{- end }}
+      - name: git-data
+        persistentVolumeClaim:
+          claimName: git-data
+      # configure.sh prepare 从 cert-manager/chentu-internal-ca 写入（key ca.crt）
+      - name: chentu-ca
+        configMap:
+          name: chentu-ca
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: git
+  namespace: {{ .Release.Namespace }}
+spec:
+  type: ClusterIP
+  selector:
+    app: git
+  ports:
+  - name: http
+    port: 3000
+    targetPort: {{ if .Values.oidc.enabled }}4180{{ else }}3000{{ end }}
+---
+# Web UI / API 经 Traefik 443 出去，用内部 CA 签的证书。不暴露裸端口。
+# Woodpecker（stack/woodpecker）以它为 forge：API 走集群内 git.git.svc:3000，浏览器授权与换 token 走这个域名。
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: git
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    cert-manager.io/cluster-issuer: chentu-internal-ca
+{{- if .Values.ingressResponseHeaders }}
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-git-browser-headers@kubernetescrd
+{{- end }}
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: {{ $host }}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend: {service: {name: git, port: {number: 3000}}}
+  tls:
+  - hosts: [{{ $host }}]
+    secretName: git-tls
+{{- if .Values.legacyRedirect.enabled }}
+{{- $old := printf "%s.%s" .Values.legacyRedirect.host $d }}
+---
+# 观察期：旧域名永久跳转到 git.<domain>，路径与查询串原样保留（P2 Q-CI-07 a）。Traefik 的 permanent
+# 跳转对 GET 回 301、其它方法回 308（两者都是永久跳转；git 客户端跟随首个跳转）。请求不会到达后端。
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: git-legacy-redirect
+  namespace: {{ .Release.Namespace }}
+spec:
+  redirectRegex:
+    regex: {{ printf "^https?://%s(?::[0-9]+)?(/.*)?$" (regexQuoteMeta $old) | quote }}
+    replacement: {{ printf "https://%s%s${1}" $host $port | quote }}
+    permanent: true
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: git-legacy-redirect
+  namespace: {{ .Release.Namespace }}
+  annotations:
+    cert-manager.io/cluster-issuer: chentu-internal-ca
+    traefik.ingress.kubernetes.io/router.middlewares: {{ .Release.Namespace }}-git-legacy-redirect@kubernetescrd
+spec:
+  ingressClassName: traefik
+  rules:
+  - host: {{ $old }}
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend: {service: {name: git, port: {number: 3000}}}
+  tls:
+  - hosts: [{{ $old }}]
+    secretName: git-legacy-redirect-tls
+{{- end }}
+
+{{- if .Values.ingressResponseHeaders }}
+---
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: git-browser-headers
+  namespace: {{ .Release.Namespace }}
+spec:
+  headers:
+    customResponseHeaders:
+{{ toYaml .Values.ingressResponseHeaders | indent 6 }}
+---
+{{- end }}

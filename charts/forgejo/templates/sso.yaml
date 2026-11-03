@@ -1,0 +1,57 @@
+{{- if .Values.oidc.enabled }}
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: git-sso
+  namespace: {{ .Release.Namespace }}
+data:
+  alpha.yaml: |
+    server:
+      bindAddress: 0.0.0.0:4180
+    upstreamConfig:
+      upstreams:
+      - id: signed-out
+        path: ^/signed-out$
+        rewriteTarget: /signed-out.html
+        uri: file:///etc/sso
+      - id: git
+        path: /
+        uri: http://127.0.0.1:3000
+        passHostHeader: true
+    providers:
+    - id: iam
+      provider: oidc
+      clientID: ${SSO_CLIENT_ID}
+      clientSecret: ${SSO_CLIENT_SECRET}
+      scope: openid profile email
+      allowedGroups: [git-user]
+      code_challenge_method: S256
+      caFiles: [/etc/chentu-ca/ca.crt]
+      useSystemTrustStore: true
+      oidcConfig:
+        issuerURL: ${SSO_ISSUER}
+        userIDClaim: sub
+        groupsClaim: roles
+        insecureSkipNonce: false
+    injectRequestHeaders:
+    - name: X-Forwarded-Preferred-Username
+      preserveRequestValue: false
+      values:
+      - claimSource: {claim: user, prefix: "iam-"}
+    - name: X-Forwarded-Email
+      preserveRequestValue: false
+      values:
+      - claimSource: {claim: email}
+  signed-out.html: |
+    <!doctype html>
+    <html lang="zh-CN">
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <title>已退出代码仓库</title>
+    <main>
+      <h1>已退出代码仓库</h1>
+      <p>其他应用的统一登录会话仍然保留。</p>
+      <a href="/oauth2/start?rd=%2F">重新登录</a>
+    </main>
+    </html>
+{{- end }}

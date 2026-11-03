@@ -1,0 +1,45 @@
+# 由 Helmfile 的环境 values 传入（values/common.yaml.gotmpl 注入 registry/domain/storageClass），
+# 不要在这里写站点相关的值（IP、域名、节点名）。
+registry: ""   # REGISTRY，镜像路径 <registry>/forgejo/forgejo:<tag>@<digest>
+domain: ""   # SITE_DOMAIN，Ingress host git.<domain>
+# Forgejo v15 LTS 上游官方镜像（codeberg.org/forgejo/forgejo，GPLv3+），只导入不重建，按多架构 index digest
+# 固定（P2 Q-K）。index 含 linux/amd64、linux/arm64、linux/arm/v6 与 attestation manifest：lab 用
+# chentu-lab image import 导入（来源登记在 lab/environments/*.yaml 的 images.git，platforms 必须列 armv6，
+# P2 F-4），机房走 bundle。deploy/helmfile/scripts/check.py 拒绝没有 sha256 digest 的引用。
+image:
+  repository: forgejo/forgejo
+  tag: "15.0.9"
+  digest: sha256:91a5310c86934339e16bd06b6078aada836e3d8935b2d70f6598108cbfaed5d1
+storageClass: local-path
+storage: 3Gi
+postgresHost: postgres.postgres.svc   # 平台共享 postgres（stack/postgres），HOST 不带端口时按 5432 连
+# 平台组织：finalize 幂等确保它与团队 developers 存在、root 在 Owners 里（R-CI-31）；Woodpecker 的
+# WOODPECKER_ORGS 只放这个组织的成员（stack/woodpecker 的 values.orgs，check.py 核对两边一致）。
+organization: platform-dev
+team: developers
+# 原生 SSO 模式：Forgejo 的 OAuth 登录源 keycloak（Keycloak client git-app，回调 /user/oauth2/keycloak/callback）。
+# 开着时 keycloak release 必须启用，git needs keycloak（R-CI-38）；client 由 configure.sh prepare 接线，登录源由
+# finalize 写入（ensure_login_source）。与下面的代理模式 oidc.enabled 互斥（都写 Secret git-oidc，共用 client
+# git-app）：用代理模式时必须把这里设成 false，check.py 与本 chart 都拒绝两者同时开。
+sso:
+  enabled: true
+# 观察期内旧域名 gitea.<domain> 永久跳转到 git.<domain>（保留路径与查询串，P2 Q-CI-07 a）。默认关：
+# 旧 gitea release 还在跑时它的 Ingress 也认这个 host，两边会抢路由。迁移 runbook 在旧实例的 Ingress
+# 删掉之后打开，观察期结束再关（stack/git/RUNBOOK.md「从旧 gitea 迁移」）。
+legacyRedirect:
+  enabled: false
+  host: gitea
+cpuRequest: 100m
+memoryRequest: 256Mi
+cpuLimit: "1"
+memoryLimit: 1Gi
+
+# Optional IAM proxy preserves stable iam-<sub> account ownership and explicit logout.
+# 代理模式（oauth2-proxy，client git-app，回调 /oauth2/callback）；与 sso.enabled 互斥，启用时设 sso.enabled: false。
+oidc:
+  enabled: false
+  trustedProxyCIDRs: []
+ingressResponseHeaders: {}
+
+# Optional hostname override; canonical default remains git.<domain>.
+publicHost: ""
