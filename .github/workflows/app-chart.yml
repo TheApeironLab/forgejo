@@ -3,7 +3,7 @@ on:
   pull_request:
     paths: ['charts/**', 'release/package.py', '.github/workflows/app-chart.yml']
   push:
-    branches: [forgejo]
+    branches: [main]
     paths: ['charts/**', 'release/package.py', '.github/workflows/app-chart.yml']
 permissions:
   contents: read
