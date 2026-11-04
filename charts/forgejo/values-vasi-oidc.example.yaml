@@ -1,0 +1,21 @@
+# Public references only; publish and pin both application and provisioner images.
+domain: example.internal
+registry: registry.example.internal
+publicUrl: https://code.example.internal
+ingress: {host: code.example.internal}
+storageClass: local-path
+imagePullSecrets: [{name: vasi-registry-pull}]
+caConfigMap: vasi-code-oidc-ca
+adminSecret: vasi-code-admin
+sso: {enabled: true}
+oidc: {enabled: false}
+auth:
+  mode: oidc
+  oidc:
+    issuer: https://iam.example.internal/realms/master
+    clientId: vasi-code-code
+    tenant: example
+    existingSecret: vasi-code-oidc
+    directorySecret: vasi-code-directory
+provisioner:
+  image: registry.example.internal/apps/code-sso:reviewed

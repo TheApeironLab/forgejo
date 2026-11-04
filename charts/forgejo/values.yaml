@@ -43,3 +43,20 @@ ingressResponseHeaders: {}
 
 # Optional hostname override; canonical default remains git.<domain>.
 publicHost: ""
+
+# Public origin and OIDC references supplied by the deployment controller.
+publicUrl: ""
+ingress: {host: ""}
+caConfigMap: chentu-ca
+imagePullSecrets: [{name: registry-pull}]
+auth:
+  mode: external
+  oidc:
+    issuer: ""
+    clientId: ""
+    existingSecret: ""
+    directorySecret: ""
+
+adminSecret: git-admin
+provisioner:
+  image: ""

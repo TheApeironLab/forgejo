@@ -1,7 +1,7 @@
 apiVersion: v2
 name: forgejo
 type: application
-version: 0.1.0
+version: 0.2.0
 appVersion: "15.0.9"
 description: Code repository and review application for Apeiron, powered by Forgejo.
 sources:
