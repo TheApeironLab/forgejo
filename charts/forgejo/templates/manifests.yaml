@@ -1,5 +1,12 @@
+{{- if and (eq .Values.auth.mode "oidc") (or (not .Values.sso.enabled) .Values.oidc.enabled) -}}
+{{- fail "managed OIDC requires native sso.enabled=true and oidc.enabled=false" -}}
+{{- end -}}
+{{- if not (has .Values.auth.mode (list "external" "oidc")) -}}
+{{- fail "auth.mode must be external or oidc" -}}
+{{- end -}}
 {{- $port := ternary "" (printf ":%d" (int (.Values.publicHttpsPort | default 443))) (eq (int (.Values.publicHttpsPort | default 443)) 443) -}}
-{{- $host := default (printf "git.%s" .Values.domain) .Values.publicHost -}}
+{{- $host := default (default (printf "git.%s" .Values.domain) .Values.publicHost) .Values.ingress.host -}}
+{{- $origin := default (printf "https://%s%s" $host $port) .Values.publicUrl -}}
 {{- /* 原生登录源（sso.enabled，默认开）与 oauth2-proxy 代理（oidc.enabled）两种 SSO 模式互斥：两边的 prepare
      都覆盖写 Secret git-oidc（同一 client git-app、不同回调），同时开着会互相覆盖（部署前校验同样拒绝） */}}
 {{- if and .Values.sso.enabled .Values.oidc.enabled }}
@@ -47,12 +54,34 @@ spec:
         checksum/sso-config: {{ include (print $.Template.BasePath "/sso.yaml") . | sha256sum }}
 {{- end }}
     spec:
-      imagePullSecrets:
-      - name: registry-pull
+      imagePullSecrets: {{ toJson .Values.imagePullSecrets }}
       # 镜像内 git 用户是 UID 1000；local-path/longhorn 新卷属 root，用 fsGroup 让 /data 可写
       securityContext:
         fsGroup: 1000
+      automountServiceAccountToken: false
+{{- if eq .Values.auth.mode "oidc" }}
+      initContainers:
+      - name: native-sso-bootstrap
+        image: {{ required "provisioner.image is required for managed OIDC" .Values.provisioner.image | quote }}
+        args: [bootstrap]
+        securityContext: {runAsUser: 1000, runAsGroup: 1000, runAsNonRoot: true, allowPrivilegeEscalation: false}
+        env: {{ include "code.ssoEnv" . | nindent 10 }}
+        volumeMounts: {{ include "code.ssoMounts" . | nindent 10 }}
+{{- end }}
       containers:
+{{- if eq .Values.auth.mode "oidc" }}
+      - name: identity-projection
+        image: {{ required "provisioner.image is required for managed OIDC" .Values.provisioner.image | quote }}
+        securityContext: {runAsUser: 1000, runAsGroup: 1000, runAsNonRoot: true, allowPrivilegeEscalation: false}
+        env: {{ include "code.ssoEnv" . | nindent 10 }}
+        volumeMounts: {{ include "code.ssoMounts" . | nindent 10 }}
+        resources:
+          requests: {cpu: 20m, memory: 48Mi}
+          limits: {memory: 256Mi}
+        readinessProbe:
+          exec: {command: [python3, /opt/code-sso/sync.py, ready]}
+          periodSeconds: 5
+{{- end }}
 {{- if .Values.oidc.enabled }}
       - name: sso
         image: {{ .Values.registry }}/oauth2-proxy/oauth2-proxy:v7.15.5
@@ -76,13 +105,13 @@ spec:
         env:
         - name: SSO_CLIENT_ID
           valueFrom:
-            secretKeyRef: {name: git-oidc, key: client-id}
+            secretKeyRef: {name: {{ default "git-oidc" .Values.auth.oidc.existingSecret }}, key: client-id}
         - name: SSO_CLIENT_SECRET
           valueFrom:
-            secretKeyRef: {name: git-oidc, key: client-secret}
+            secretKeyRef: {name: {{ default "git-oidc" .Values.auth.oidc.existingSecret }}, key: client-secret}
         - name: SSO_ISSUER
           valueFrom:
-            secretKeyRef: {name: git-oidc, key: issuer}
+            secretKeyRef: {name: {{ default "git-oidc" .Values.auth.oidc.existingSecret }}, key: issuer}
         - name: OAUTH2_PROXY_COOKIE_SECRET
           valueFrom:
             secretKeyRef: {name: git-sso-session, key: cookie-secret}
@@ -109,6 +138,15 @@ spec:
         # tag 只给人看与 bundle 路径对得上；拉取与运行以 index digest 为准（containerd 按 digest 取）
         image: {{ printf "%s/%s:%s@%s" .Values.registry $img.repository $img.tag $img.digest | quote }}
         imagePullPolicy: IfNotPresent
+{{- if eq .Values.auth.mode "oidc" }}
+        # Init has already migrated the database and owns app.ini. Start Web as
+        # git directly; the image's root s6 setup otherwise creates root-owned
+        # SSH files inside a directory the init container already owns.
+        command: [/bin/sh, -ec]
+        args:
+        - environment-to-ini --config /data/gitea/conf/app.ini; exec forgejo --work-path /data/gitea --custom-path /data/gitea --config /data/gitea/conf/app.ini web
+        securityContext: {runAsUser: 1000, runAsGroup: 1000, runAsNonRoot: true, allowPrivilegeEscalation: false, capabilities: {drop: [ALL]}}
+{{- end }}
         ports:
         - containerPort: 3000
           name: http
@@ -152,8 +190,12 @@ spec:
           value: {{ $host }}
         - name: GITEA__server__LFS_START_SERVER
           value: "true"
+{{- if eq .Values.auth.mode "oidc" }}
+        - {name: GITEA__server__DISABLE_SSH, value: "true"}
+        - {name: GITEA__repository__ROOT, value: /data/git/repositories}
+{{- end }}
         - name: GITEA__server__ROOT_URL
-          value: https://{{ $host }}{{ $port }}
+          value: {{ $origin | quote }}
         # 关掉安装向导；管理员由 configure.sh 用 CLI 建（凭据在 Secret git-admin）
         - name: GITEA__security__INSTALL_LOCK
           value: "true"
@@ -169,7 +211,7 @@ spec:
         - name: GITEA__service__DISABLE_REGISTRATION
           value: "true"
         - name: GITEA__oauth2_client__ENABLE_AUTO_REGISTRATION
-          value: "true"
+          value: {{ ternary "false" "true" (eq .Values.auth.mode "oidc") | quote }}
         - name: GITEA__oauth2_client__ACCOUNT_LINKING
           value: disabled
         # v15 不认 preferred_username（告警后回退 nickname，P2 02b K-12）；Keycloak client git-app 的
@@ -229,6 +271,14 @@ spec:
           periodSeconds: 30
           failureThreshold: 5
       volumes:
+{{- if eq .Values.auth.mode "oidc" }}
+      - name: oidc-credentials
+        secret: {secretName: {{ required "auth.oidc.existingSecret is required" .Values.auth.oidc.existingSecret }}}
+      - name: directory-credentials
+        secret: {secretName: {{ required "auth.oidc.directorySecret is required" .Values.auth.oidc.directorySecret }}}
+      - name: admin-credentials
+        secret: {secretName: {{ .Values.adminSecret }}}
+{{- end }}
 {{- if .Values.oidc.enabled }}
       - name: sso-config
         configMap: {name: git-sso}
@@ -239,7 +289,7 @@ spec:
       # configure.sh prepare 从 cert-manager/chentu-internal-ca 写入（key ca.crt）
       - name: chentu-ca
         configMap:
-          name: chentu-ca
+          name: {{ .Values.caConfigMap }}
 ---
 apiVersion: v1
 kind: Service
